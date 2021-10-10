@@ -52,6 +52,7 @@ class AssistantMQTT:
             self.topic = topic
 
         def publish(self, message):
+            print('publish ' + str(message))
             self.mqtt_client.publish(self.topic, message)
 
     def mqtt_on_connect(self, client, userdata, flags, rc):
@@ -65,11 +66,13 @@ class AssistantMQTT:
             self.mqtt_client.reconnect()
 
     def make_binary_sensor(self, id_suffix, name, device_class):
-        topic_base = self.format_topic_base('binary_sensor', self.format_unique_id(id_suffix))
+        unique_id = self.format_unique_id(id_suffix)
+        topic_base = self.format_topic_base('binary_sensor', unique_id)
         topic_publish = topic_base + 'state'
 
         payload = {
                 'name': name,
+                'unique_id': unique_id,
                 'device_class': device_class,
                 'state_topic': topic_publish
                 }
@@ -78,11 +81,13 @@ class AssistantMQTT:
         return self.AssistantMQTTPublisher(self.mqtt_client, topic_publish)
 
     def make_select(self, id_suffix, name, options):
-        topic_base = self.format_topic_base('select', self.format_unique_id(id_suffix))
+        unique_id = self.format_unique_id(id_suffix)
+        topic_base = self.format_topic_base('select', unique_id)
         topic_publish = topic_base + 'state'
 
         payload = {
                 'name': name,
+                'unique_id': unique_id,
                 'options': options,
                 'state_topic': topic_publish,
                 'command_topic': topic_base + 'set'
@@ -90,6 +95,96 @@ class AssistantMQTT:
         self.publish_config(topic_base, payload)
 
         return self.AssistantMQTTPublisher(self.mqtt_client, topic_publish)
+
+    def handle_message_switch(self, mqttc, obj, msg, callback):
+        payload = msg.payload.decode()
+        if(payload == 'ON'):
+            callback(True)
+        elif(payload == 'OFF'):
+            callback(False)
+
+    def make_switch(self, id_suffix, name, set_callback):
+        unique_id = self.format_unique_id(id_suffix)
+        topic_base = self.format_topic_base('switch', unique_id)
+
+        payload = {
+                'name': name,
+                'unique_id': unique_id,
+                'state_topic': topic_base + 'state',
+                'command_topic': topic_base + 'set'
+                }
+        self.publish_config(topic_base, payload)
+
+        self.mqtt_client.message_callback_add(payload['command_topic'],
+                lambda mqttc, obj, msg, callback=set_callback
+                : self.handle_message_switch(mqttc, obj, msg, callback))
+        self.mqtt_client.subscribe(payload['command_topic'])
+
+        return self.AssistantMQTTPublisher(self.mqtt_client, payload['state_topic'])
+
+    def handle_message_number(self, mqttc, obj, msg, callback):
+        print(msg.payload)
+        callback(float(msg.payload))
+
+    def make_number(self, id_suffix, name, minimum, maximum, set_callback):
+        unique_id = self.format_unique_id(id_suffix)
+        topic_base = self.format_topic_base('number', unique_id)
+
+        payload = {
+                'name': name,
+                'unique_id': unique_id,
+                'min': minimum,
+                'max': maximum,
+                'state_topic': topic_base + 'state',
+                'command_topic': topic_base + 'set'
+                }
+        self.publish_config(topic_base, payload)
+
+        self.mqtt_client.message_callback_add(payload['command_topic'],
+                lambda mqttc, obj, msg, callback=set_callback
+                : self.handle_message_number(mqttc, obj, msg, callback))
+        self.mqtt_client.subscribe(payload['command_topic'])
+
+        return self.AssistantMQTTPublisher(self.mqtt_client, payload['state_topic'])
+
+class HAVRSwitch:
+    publisher = None
+    setting_section = None
+    setting_name = None
+
+    def set_state(self, state):
+        ovr_settings.setBool(self.setting_section, self.setting_name, state)
+
+    def update(self):
+        print('update')
+        self.publisher.publish('ON' if ovr_settings.getBool(self.setting_section, self.setting_name) else 'OFF')
+
+    def __init__(self, ha_mqtt, id_suffix, name, setting_section, setting_name):
+        self.publisher = ha_mqtt.make_switch(id_suffix, name, self.set_state)
+        self.setting_section = setting_section
+        self.setting_name = setting_name
+
+class HAVRNumber:
+    publisher = None
+    setting_section = None
+    setting_name = None
+    maximum = 0.0
+    minimum = 0.0
+
+    def set_state(self, state):
+        clamped_state = max(self.minimum, min(self.maximum, state))
+        ovr_settings.setFloat(self.setting_section, self.setting_name, clamped_state)
+
+    def update(self):
+        print('update')
+        self.publisher.publish(ovr_settings.getFloat(self.setting_section, self.setting_name))
+
+    def __init__(self, ha_mqtt, id_suffix, name, setting_section, setting_name, minimum, maximum):
+        self.publisher = ha_mqtt.make_number(id_suffix, name, minimum, maximum, self.set_state)
+        self.setting_section = setting_section
+        self.setting_name = setting_name
+        self.minimum = minimum
+        self.maximum = maximum
 
 def get_app_names():
     app_count = openvr.VRApplications().getApplicationCount()
@@ -111,6 +206,7 @@ def ha_mqtt_exit():
 try:
     ovr = openvr.init(openvr.VRApplication_Overlay)
     ovr_apps = openvr.VRApplications()
+    ovr_settings = openvr.VRSettings()
     atexit.register(openvr.shutdown)
 except:
     print('Failed to connect to OpenVR, is SteamVR running?')
@@ -181,10 +277,39 @@ ha_mqtt = AssistantMQTT(
         port = mqtt_port,
         client_id = platform.node())
 atexit.register(ha_mqtt_exit)
+
+# Setup sensors
 ha_ovr_activity = ha_mqtt.make_binary_sensor('ovr_activity', 'VR Headset', 'occupancy')
 ha_ovr_application = ha_mqtt.make_select('ovr_application', 'VR Application', get_app_names())
 ha_ovr_online = ha_mqtt.make_binary_sensor('ovr_online', 'SteamVR', 'connectivity')
 ha_ovr_online.publish('ON')
+
+# Setup switches
+havr_ovr_center_marker = HAVRSwitch(
+        ha_mqtt = ha_mqtt,
+        id_suffix = 'ovr_center_marker',
+        name = 'SteamVR Center Marker',
+        setting_section = openvr.k_pch_CollisionBounds_Section,
+        setting_name = openvr.k_pch_CollisionBounds_CenterMarkerOn_Bool)
+havr_ovr_center_marker.update()
+
+havr_ovr_ground_perimeter = HAVRSwitch(
+        ha_mqtt = ha_mqtt,
+        id_suffix = 'ovr_ground_perimeter',
+        name = 'SteamVR Ground Perimeter',
+        setting_section = openvr.k_pch_CollisionBounds_Section,
+        setting_name = openvr.k_pch_CollisionBounds_GroundPerimeterOn_Bool)
+havr_ovr_ground_perimeter.update()
+
+havr_ovr_brightness = HAVRNumber(
+        ha_mqtt = ha_mqtt,
+        id_suffix = 'ovr_brightness',
+        name = 'SteamVR Display Brightness',
+        setting_section = openvr.k_pch_SteamVR_Section,
+        setting_name = 'analogGain',
+        minimum = 0.0,
+        maximum = 1.6)
+havr_ovr_brightness.update()
 
 # Main loop
 while True:
@@ -213,4 +338,11 @@ while True:
         while ovr.pollNextEvent(event):
             if(event.eventType == openvr.VREvent_Quit):
                 exit()
+            elif(event.eventType == openvr.VREvent_ChaperoneSettingsHaveChanged):
+                havr_ovr_center_marker.update()
+                havr_ovr_ground_perimeter.update()
+            elif(event.eventType == openvr.VREvent_SteamVRSectionSettingChanged):
+                havr_ovr_brightness.update()
+                print('awoo ' + str(ovr_settings.getFloat(openvr.k_pch_SteamVR_Section,
+                        'analogGain')))
         time.sleep(1/10) # poll events at least 10 times per second

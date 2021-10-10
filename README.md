@@ -7,3 +7,8 @@ Current information that is sent is:
 * Whether SteamVR is running
 * Whether headset is worn
 * Current game being played
+
+The following settings can also be controlled:
+* Display brightness
+* Floor bounds visible
+* Center marker visible
